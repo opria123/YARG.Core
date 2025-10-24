@@ -52,6 +52,8 @@ namespace YARG.Core.Engine
 
         protected List<WaitCountdown> WaitCountdowns = new();
 
+        public IReadOnlyList<WaitCountdown> WaitCountdownsReadOnly => WaitCountdowns;
+
         protected readonly Queue<GameInput> InputQueue = new();
 
         private readonly List<EngineFrameUpdate> _scheduledUpdates = new();

@@ -201,6 +201,37 @@ namespace YARG.Core.Engine
 
             private void OnKeysOverhit(int key) => OnOverstrum();
 
+            public void SyncRemoteStarPowerState(bool active)
+            {
+                OnStarPowerStatus(active);
+            }
+
+            public void ApplyRemoteNoteResult(int noteWeight, bool wasHit)
+            {
+                if (noteWeight <= 0)
+                {
+                    return;
+                }
+
+                float delta;
+
+                if (wasHit)
+                {
+                    delta = HAPPINESS_PER_NOTE_HIT * RockMeterPreset.HitRecoveryMultiplier;
+
+                    if (_engineManager.IsAnyStarpowerActive)
+                    {
+                        delta *= RockMeterPreset.StarPowerEffectMultiplier;
+                    }
+                }
+                else
+                {
+                    delta = -1 * HAPPINESS_PER_NOTE_MISS * RockMeterPreset.MissDamageMultiplier;
+                }
+
+                AddHappiness(delta * noteWeight);
+            }
+
             private void AddHappiness(float delta)
             {
                 Happiness = Math.Clamp(Happiness + delta, HAPPINESS_MINIMUM, 1f);

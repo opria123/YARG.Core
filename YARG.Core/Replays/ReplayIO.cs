@@ -224,9 +224,38 @@ namespace YARG.Core.Replays
                 var replayChecksum = HashWrapper.Hash(replayData);
 
                 var date = DateTime.Now;
-                var replayName = ReplayInfo.ConstructReplayName(song.Name, song.Artist, song.Charter, in date);
+                Directory.CreateDirectory(directory);
 
-                var path = Path.Combine(directory, replayName + ".replay");
+                var baseReplayName = ReplayInfo.ConstructReplayName(song.Name, song.Artist, song.Charter, in date);
+                string replayName = baseReplayName;
+                string path = null;
+
+                FileStream replayStream = null;
+                for (int attempt = 0; attempt < 10; attempt++)
+                {
+                    string candidateName = attempt == 0 ? baseReplayName : $"{baseReplayName}_{attempt}";
+                    string candidatePath = Path.Combine(directory, candidateName + ".replay");
+
+                    try
+                    {
+                        replayStream = new FileStream(candidatePath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+                        replayName = candidateName;
+                        path = candidatePath;
+                        break;
+                    }
+                    catch (IOException ioEx) when (ShouldRetryReplayWrite(ioEx))
+                    {
+                        continue;
+                    }
+                }
+
+                if (replayStream == null)
+                {
+                    throw new IOException("Unable to create a unique replay file after multiple attempts.");
+                }
+
+                using var fstream = replayStream;
+
                 var info = new ReplayInfo(path, replayName, REPLAY_VERSIONS.CURRENT, ENGINE_VERSION, in replayChecksum, song.Name, song.Artist, song.Charter, song.Hash, in date, speed, length, score, stars, stats);
 
                 // Write all the data for the header hash
@@ -238,13 +267,14 @@ namespace YARG.Core.Replays
                 var headerChecksum = HashWrapper.Hash(headerData);
 
                 // Write all processed data to the file
-                using var fstream = File.OpenWrite(path);
                 using var fileWriter = new BinaryWriter(fstream);
                 REPLAY_MAGIC_HEADER.Serialize(fileWriter);
                 headerChecksum.Serialize(fileWriter);
                 fileWriter.Write(headerData.Length);
                 fileWriter.Write(headerData);
                 fileWriter.Write(replayData);
+                fileWriter.Flush();
+                fstream.Flush(true);
                 return (true, info);
             }
             catch (Exception e)
@@ -252,6 +282,14 @@ namespace YARG.Core.Replays
                 YargLogger.LogException(e, "Failed to save replay to file");
                 return (false, null!);
             }
+        }
+
+        private static bool ShouldRetryReplayWrite(IOException exception)
+        {
+            const int ERROR_SHARING_VIOLATION = unchecked((int)0x80070020);
+            const int ERROR_ALREADY_EXISTS = unchecked((int)0x800700B7);
+            int hresult = exception.HResult;
+            return hresult == ERROR_SHARING_VIOLATION || hresult == ERROR_ALREADY_EXISTS;
         }
 
         private static (ReplayReadResult, ReplayInfo) ReadInfo_Old(string path, FileStream fstream)
