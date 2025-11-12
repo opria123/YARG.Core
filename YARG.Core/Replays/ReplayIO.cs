@@ -32,11 +32,15 @@ namespace YARG.Core.Replays
         private static readonly (int OLD_MIN, int METADATA_MIN, int DATA_MIN, int CURRENT) REPLAY_VERSIONS = (4, 6, 9, 9);
         private const int ENGINE_VERSION = 4;
 
+        private const int ERROR_SHARING_VIOLATION = unchecked((int) 0x80070020);
+        private const int ERROR_ALREADY_EXISTS = unchecked((int) 0x800700B7);
+        private const int ERROR_FILE_EXISTS = unchecked((int) 0x80070050);
+
         public static (ReplayReadResult Result, ReplayInfo Info, ReplayData Data) TryDeserialize(string path, ReplayReadOptions replayOptions)
         {
             try
             {
-                using var fstream = File.OpenRead(path);
+                using var fstream = OpenReplayReadStream(path);
                 if (!REPLAY_MAGIC_HEADER.Matches(fstream))
                 {
                     fstream.Position = 0;
@@ -81,6 +85,10 @@ namespace YARG.Core.Replays
                 var replayData = new ReplayData(data.ToValueStream(), info.ReplayVersion, replayOptions);
                 return (ReplayReadResult.Valid, info, replayData);
             }
+            catch (IOException ioEx) when (ioEx.HResult == ERROR_SHARING_VIOLATION)
+            {
+                return (ReplayReadResult.FileNotFound, null!, null!);
+            }
             catch (Exception ex)
             {
                 YargLogger.LogException(ex, "Failed to read replay file");
@@ -92,7 +100,7 @@ namespace YARG.Core.Replays
         {
             try
             {
-                using var fstream = File.OpenRead(path);
+                using var fstream = OpenReplayReadStream(path);
                 if (!REPLAY_MAGIC_HEADER.Matches(fstream))
                 {
                     fstream.Position = 0;
@@ -139,6 +147,10 @@ namespace YARG.Core.Replays
                 }
                 return (ReplayReadResult.Valid, info);
             }
+            catch (IOException ioEx) when (ioEx.HResult == ERROR_SHARING_VIOLATION)
+            {
+                return (ReplayReadResult.FileNotFound, null!);
+            }
             catch (Exception ex)
             {
                 YargLogger.LogException(ex, "Failed to read replay file");
@@ -150,7 +162,7 @@ namespace YARG.Core.Replays
         {
             try
             {
-                using var fstream = File.OpenRead(info.FilePath);
+                using var fstream = OpenReplayReadStream(info.FilePath);
                 if (!REPLAY_MAGIC_HEADER.Matches(fstream))
                 {
                     fstream.Position = 0;
@@ -208,6 +220,10 @@ namespace YARG.Core.Replays
                 var replayData = new ReplayData(data.ToValueStream(), info.ReplayVersion, readOptions);
                 return (ReplayReadResult.Valid, replayData);
             }
+            catch (IOException ioEx) when (ioEx.HResult == ERROR_SHARING_VIOLATION)
+            {
+                return (ReplayReadResult.FileNotFound, null!);
+            }
             catch (Exception ex)
             {
                 YargLogger.LogException(ex, "Failed to read replay file");
@@ -227,6 +243,17 @@ namespace YARG.Core.Replays
                 Directory.CreateDirectory(directory);
 
                 var baseReplayName = ReplayInfo.ConstructReplayName(song.Name, song.Artist, song.Charter, in date);
+                var baseReplayPath = Path.Combine(directory, baseReplayName + ".replay");
+
+                if (File.Exists(baseReplayPath))
+                {
+                    var (existingResult, existingInfo) = TryReadMetadata(baseReplayPath);
+                    if (existingResult == ReplayReadResult.Valid && existingInfo.ReplayChecksum.Equals(replayChecksum))
+                    {
+                        return (true, existingInfo);
+                    }
+                }
+
                 string replayName = baseReplayName;
                 string path = null;
 
@@ -234,7 +261,7 @@ namespace YARG.Core.Replays
                 for (int attempt = 0; attempt < 10; attempt++)
                 {
                     string candidateName = attempt == 0 ? baseReplayName : $"{baseReplayName}_{attempt}";
-                    string candidatePath = Path.Combine(directory, candidateName + ".replay");
+                    string candidatePath = attempt == 0 ? baseReplayPath : Path.Combine(directory, candidateName + ".replay");
 
                     try
                     {
@@ -286,10 +313,15 @@ namespace YARG.Core.Replays
 
         private static bool ShouldRetryReplayWrite(IOException exception)
         {
-            const int ERROR_SHARING_VIOLATION = unchecked((int)0x80070020);
-            const int ERROR_ALREADY_EXISTS = unchecked((int)0x800700B7);
             int hresult = exception.HResult;
-            return hresult == ERROR_SHARING_VIOLATION || hresult == ERROR_ALREADY_EXISTS;
+            return hresult == ERROR_SHARING_VIOLATION
+                || hresult == ERROR_ALREADY_EXISTS
+                || hresult == ERROR_FILE_EXISTS;
+        }
+
+        private static FileStream OpenReplayReadStream(string path)
+        {
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         }
 
         private static (ReplayReadResult, ReplayInfo) ReadInfo_Old(string path, FileStream fstream)
