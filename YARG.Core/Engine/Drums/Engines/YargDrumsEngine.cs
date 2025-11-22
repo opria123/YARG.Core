@@ -8,8 +8,8 @@ namespace YARG.Core.Engine.Drums.Engines
     public class YargDrumsEngine : DrumsEngine
     {
         public YargDrumsEngine(InstrumentDifficulty<DrumNote> chart, SyncTrack syncTrack,
-            DrumsEngineParameters engineParameters, bool isBot)
-            : base(chart, syncTrack, engineParameters, isBot)
+            DrumsEngineParameters engineParameters, bool isBot, bool isMidiDrumsInput)
+            : base(chart, syncTrack, engineParameters, isBot, isMidiDrumsInput)
         {
         }
 
@@ -20,10 +20,51 @@ namespace YARG.Core.Engine.Drums.Engines
             // Every button release has its gameInput.Axis set to 0, so this works safely.
             if (gameInput.Axis > 0)
             {
-                Action = gameInput.GetAction<DrumsAction>();
-                PadHit = ConvertInputToPad(EngineParameters.Mode, gameInput.GetAction<DrumsAction>());
+                if (IsMidiDrumsInput)
+                {
+                    var eliteDrumsAction = gameInput.GetAction<EliteDrumsAction>();
+                    Action = ConvertMidiDrumsInput(eliteDrumsAction, Chart.Instrument);
+                    PadHit = Action is null ? null : ConvertInputToPad(EngineParameters.Mode, Action.Value);
+                } else
+                {
+                    Action = gameInput.GetAction<DrumsAction>();
+                    PadHit = ConvertInputToPad(EngineParameters.Mode, gameInput.GetAction<DrumsAction>());
+                }
                 HitVelocity = gameInput.Axis;
             }
+        }
+
+        private DrumsAction? ConvertMidiDrumsInput(EliteDrumsAction action, Instrument target)
+        {
+            if (target is Instrument.FourLaneDrums or Instrument.ProDrums)
+            {
+                return action switch
+                {
+                    EliteDrumsAction.Kick => DrumsAction.Kick,
+                    EliteDrumsAction.FourLaneRedDrum => DrumsAction.Drum1,
+                    EliteDrumsAction.FourLaneYellowDrum => DrumsAction.Drum2,
+                    EliteDrumsAction.FourLaneBlueDrum => DrumsAction.Drum3,
+                    EliteDrumsAction.FourLaneGreenDrum => DrumsAction.Drum4,
+                    EliteDrumsAction.FourLaneYellowCymbal => DrumsAction.Cymbal1,
+                    EliteDrumsAction.FourLaneBlueCymbal => DrumsAction.Cymbal2,
+                    EliteDrumsAction.FourLaneGreenCymbal => DrumsAction.Cymbal3,
+                    _ => null
+                };
+            } if (target is Instrument.FiveLaneDrums)
+            {
+                return action switch
+                {
+                    EliteDrumsAction.Kick => DrumsAction.Kick,
+                    EliteDrumsAction.FiveLaneRedDrum => DrumsAction.Drum1,
+                    EliteDrumsAction.FiveLaneYellowCymbal => DrumsAction.Cymbal1,
+                    EliteDrumsAction.FiveLaneBlueDrum => DrumsAction.Drum3,
+                    EliteDrumsAction.FiveLaneOrangeCymbal => DrumsAction.Cymbal2,
+                    EliteDrumsAction.FiveLaneGreenDrum => DrumsAction.Drum4,
+                    _ => null
+                };
+            }
+
+            return null;
         }
 
         protected override void UpdateHitLogic(double time)
@@ -38,7 +79,7 @@ namespace YARG.Core.Engine.Drums.Engines
             }
             else if (Action is { } padAction)
             {
-                OnPadHit?.Invoke(padAction, false, HitVelocity.GetValueOrDefault(0));
+                OnPadHit?.Invoke(padAction, false, false, DrumNoteType.Neutral, HitVelocity.GetValueOrDefault(0));
                 ResetPadState();
             }
         }
@@ -87,7 +128,7 @@ namespace YARG.Core.Engine.Drums.Engines
                         // TODO - Deadly Dynamics modifier check on awardVelocityBonus
 
                         HitNote(note);
-                        OnPadHit?.Invoke(Action!.Value, true, HitVelocity.GetValueOrDefault(0));
+                        OnPadHit?.Invoke(Action!.Value, true, awardVelocityBonus, note.Type, HitVelocity.GetValueOrDefault(0));
 
                         if (awardVelocityBonus)
                         {
@@ -127,7 +168,7 @@ namespace YARG.Core.Engine.Drums.Engines
             // If no note was hit but the user hit a pad, then over hit
             if (PadHit != null)
             {
-                OnPadHit?.Invoke(Action!.Value, false, HitVelocity.GetValueOrDefault(0));
+                OnPadHit?.Invoke(Action!.Value, false, false, DrumNoteType.Neutral, HitVelocity.GetValueOrDefault(0));
                 Overhit();
                 ResetPadState();
             }
