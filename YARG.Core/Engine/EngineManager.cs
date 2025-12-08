@@ -15,6 +15,13 @@ namespace YARG.Core.Engine
         public List<EngineContainer> Engines => _allEngines;
 
         private SongChart?               _chart;
+        
+        /// <summary>
+        /// When true, disables automatic unison bonus awarding.
+        /// Use this in networked multiplayer where unison coordination is handled externally.
+        /// External code should call Engine.AwardUnisonBonus() directly when appropriate.
+        /// </summary>
+        public bool DisableAutomaticUnisonBonuses { get; set; } = false;
 
         public partial class EngineContainer
         {

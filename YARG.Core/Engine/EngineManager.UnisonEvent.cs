@@ -133,8 +133,22 @@ namespace YARG.Core.Engine
         public delegate void UnisonPhrasesReadyEvent(List<UnisonEvent> unisonEvents);
 
         public delegate void UnisonPhraseSuccessEvent();
+        
+        /// <summary>
+        /// Fired when a player hits a star power phrase that is part of a unison.
+        /// Parameters: phraseTime, phraseEndTime
+        /// Use this in networked multiplayer to sync unison phrase completions across the network.
+        /// </summary>
+        public delegate void UnisonPhraseHitEvent(double phraseTime, double phraseEndTime);
 
         public  UnisonPhraseSuccessEvent?                       OnUnisonPhraseSuccess;
+        
+        /// <summary>
+        /// Event fired when a player hits a unison phrase.
+        /// Subscribe to this to handle network synchronization of unison bonuses.
+        /// </summary>
+        public  UnisonPhraseHitEvent?                           OnUnisonPhraseHit;
+        
         private bool                                            _unisonsReady      = false;
         private int                                             _playerCount  = 0;
 
@@ -383,10 +397,23 @@ namespace YARG.Core.Engine
                 // so an exact match is impossible even though the phrases have identical times
                 if (unison.Time <= time && time <= unison.TimeEnd)
                 {
+                    // Fire the event for network synchronization (before checking success)
+                    // This allows the network layer to track phrase completions
+                    OnUnisonPhraseHit?.Invoke(unison.Time, unison.TimeEnd);
+                    
                     if (unison.Success(container))
                     {
                         // Success returned true, so all the other players
                         // were also successful
+                        
+                        // In networked multiplayer, unison bonuses are handled externally
+                        // to coordinate across all networked players
+                        if (DisableAutomaticUnisonBonuses)
+                        {
+                            YargLogger.LogDebug("EngineManager unison success detected, but automatic bonuses disabled (networked mode)");
+                            continue;
+                        }
+                        
                         YargLogger.LogDebug("EngineManager bonus SP award triggered");
                         AwardStarPowerBonus(unison);
                     }
