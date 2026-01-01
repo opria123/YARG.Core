@@ -67,10 +67,24 @@ namespace YARG.Core.Engine
         public delegate void SongFailed();
         public delegate void HappinessOverThreshold();
         public delegate void HappinessUnderThreshold();
+        public delegate void PlayerRevived(int engineId, float newHappiness);
+        public delegate void PlayerFailed(int engineId);
 
         public event SongFailed? OnSongFailed;
         public event HappinessOverThreshold? OnHappinessOverThreshold;
         public event HappinessUnderThreshold? OnHappinessUnderThreshold;
+        public event PlayerRevived? OnPlayerRevived;
+        /// <summary>
+        /// Fired when an individual player's happiness drops to the fail threshold.
+        /// The player can still be revived via Star Power.
+        /// </summary>
+        public event PlayerFailed? OnPlayerFailed;
+
+        /// <summary>
+        /// The amount of happiness to give a revived player.
+        /// Set to 50% to give them a fighting chance without making revival too easy.
+        /// </summary>
+        private const float REVIVAL_HAPPINESS = 0.5f;
 
         public void InitializeHappiness()
         {
@@ -82,9 +96,136 @@ namespace YARG.Core.Engine
             UpdateHappiness();
         }
 
+        /// <summary>
+        /// Attempts to revive all failed players when Star Power is activated.
+        /// Returns true if any player was revived.
+        /// </summary>
+        /// <returns>True if at least one player was revived.</returns>
+        public bool TryReviveFailedPlayers()
+        {
+            return TryReviveFailedPlayers(null);
+        }
+
+        /// <summary>
+        /// Attempts to revive failed players, optionally filtering by a predicate.
+        /// </summary>
+        /// <param name="shouldRevive">Optional predicate to filter which engine IDs should be revived. If null, all failed players are revived.</param>
+        /// <returns>True if at least one player was revived.</returns>
+        public bool TryReviveFailedPlayers(Func<int, bool>? shouldRevive)
+        {
+            bool anyRevived = false;
+            
+            foreach (var container in _allEngines)
+            {
+                // Check if this engine's happiness is at or below the fail threshold
+                if (container.Happiness <= HAPPINESS_FAIL_THRESHOLD)
+                {
+                    // Apply filter if provided
+                    if (shouldRevive != null && !shouldRevive(container.EngineId))
+                    {
+                        continue;
+                    }
+                    
+                    container.RevivePlayer(REVIVAL_HAPPINESS);
+                    OnPlayerRevived?.Invoke(container.EngineId, REVIVAL_HAPPINESS);
+                    anyRevived = true;
+                    
+                    YargLogger.LogFormatInfo("[EngineManager] Revived player (EngineId: {0}) with {1:P0} happiness via Star Power", 
+                        container.EngineId, REVIVAL_HAPPINESS);
+                }
+            }
+            
+            if (anyRevived)
+            {
+                UpdateHappiness();
+            }
+            
+            return anyRevived;
+        }
+
+        /// <summary>
+        /// Revives a specific player by engine ID.
+        /// Used for network-synced revivals.
+        /// </summary>
+        /// <param name="engineId">The engine ID of the player to revive.</param>
+        /// <param name="targetHappiness">The happiness level to set (default: 0.5).</param>
+        /// <returns>True if the player was found and revived.</returns>
+        public bool RevivePlayer(int engineId, float targetHappiness = 0.5f)
+        {
+            if (_allEnginesById.TryGetValue(engineId, out var container))
+            {
+                container.RevivePlayer(targetHappiness);
+                OnPlayerRevived?.Invoke(engineId, targetHappiness);
+                UpdateHappiness();
+                
+                YargLogger.LogFormatInfo("[EngineManager] Revived player (EngineId: {0}) with {1:P0} happiness", 
+                    engineId, targetHappiness);
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Checks if any player has failed (happiness at or below fail threshold).
+        /// </summary>
+        public bool HasAnyFailedPlayer()
+        {
+            foreach (var container in _allEngines)
+            {
+                if (container.Happiness <= HAPPINESS_FAIL_THRESHOLD)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Returns true if all players have failed.
+        /// </summary>
+        public bool HaveAllPlayersFailed()
+        {
+            if (_allEngines.Count == 0)
+                return false;
+                
+            foreach (var container in _allEngines)
+            {
+                if (!container.HasFailed)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        
+        /// <summary>
+        /// Gets the number of players who have failed.
+        /// </summary>
+        public int GetFailedPlayerCount()
+        {
+            int count = 0;
+            foreach (var container in _allEngines)
+            {
+                if (container.HasFailed)
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+        
+        /// <summary>
+        /// Gets the number of players who are still alive (not failed).
+        /// </summary>
+        public int GetAlivePlayerCount()
+        {
+            return _allEngines.Count - GetFailedPlayerCount();
+        }
+
         private bool UpdateHappiness()
         {
-            if (Happiness < HAPPINESS_FAIL_THRESHOLD)
+            // Check if ALL players have failed - only then trigger OnSongFailed
+            if (HaveAllPlayersFailed())
             {
                 OnSongFailed?.Invoke();
                 return true;
@@ -133,10 +274,89 @@ namespace YARG.Core.Engine
         public partial class EngineContainer
         {
             public float Happiness { get; private set; } = 0.0f;
+            
+            /// <summary>
+            /// Whether this player has failed (happiness at or below fail threshold).
+            /// A failed player can be revived via Star Power.
+            /// </summary>
+            public bool HasFailed { get; private set; } = false;
+            
+            /// <summary>
+            /// Grace period after revival (in seconds) where no happiness damage is taken.
+            /// This gives the player time for their track to raise back up.
+            /// Set to 4 seconds as a reasonable default (actual value may be tempo-based in GameManager).
+            /// </summary>
+            private const double REVIVAL_GRACE_PERIOD = 4.0;
+            
+            /// <summary>
+            /// The engine time when the grace period ends. -1 = no grace period active.
+            /// </summary>
+            private double _graceEndTime = -1;
+            
+            /// <summary>
+            /// Fallback: number of negative happiness events to ignore during grace period.
+            /// Used when engine time isn't advancing (e.g., remote players).
+            /// </summary>
+            private int _graceEventsRemaining = 0;
+            
+            /// <summary>
+            /// Maximum number of miss events to ignore during grace period.
+            /// At typical note density, this is roughly equivalent to 4 seconds.
+            /// </summary>
+            private const int GRACE_EVENTS_MAX = 40;
+            
+            /// <summary>
+            /// Set to true when this player has been revived locally (via Star Power from another player).
+            /// Used to prevent duplicate revival events when network sync catches up.
+            /// Reset when the player fails again.
+            /// </summary>
+            private bool _wasRevivedLocally = false;
+            
+            /// <summary>
+            /// Whether the player is currently in a post-revival grace period.
+            /// Uses time-based check if engine time is advancing, otherwise event-count fallback.
+            /// </summary>
+            public bool IsInGracePeriod 
+            {
+                get
+                {
+                    // Time-based grace period (for local players)
+                    if (_graceEndTime > 0 && Engine.CurrentTime < _graceEndTime)
+                    {
+                        return true;
+                    }
+                    // Event-count fallback (for remote players whose engine time may not advance)
+                    return _graceEventsRemaining > 0;
+                }
+            }
 
             public void ResetHappiness()
             {
                 Happiness = RockMeterPreset.StartingHappiness;
+                HasFailed = false;
+                _wasRevivedLocally = false;
+                _graceEndTime = -1;
+                _graceEventsRemaining = 0;
+            }
+
+            /// <summary>
+            /// Revives this player by setting their happiness to the specified level.
+            /// Used when Star Power is activated to bring back failed players.
+            /// Grants a grace period where no damage is taken to allow the track to raise.
+            /// </summary>
+            /// <param name="targetHappiness">The happiness level to set (0.0 to 1.0).</param>
+            public void RevivePlayer(float targetHappiness)
+            {
+                Happiness = Math.Clamp(targetHappiness, 0.1f, RockMeterPreset.StartingHappiness);
+                HasFailed = false;
+                // Mark that we revived this player locally - this prevents duplicate
+                // revival events when network sync catches up with our local state
+                _wasRevivedLocally = true;
+                // Grant grace period so player has time for track to come back
+                // Time-based for local players
+                _graceEndTime = Engine.CurrentTime + REVIVAL_GRACE_PERIOD;
+                // Event-count fallback for remote players
+                _graceEventsRemaining = GRACE_EVENTS_MAX;
             }
 
             private void OnVocalPhraseHit(double hitPercentAfterParams, bool fullPoints, bool isLastPhrase)
@@ -206,35 +426,122 @@ namespace YARG.Core.Engine
                 OnStarPowerStatus(active);
             }
 
-            public void ApplyRemoteNoteResult(int noteWeight, bool wasHit)
+            /// <summary>
+            /// Syncs the happiness and fail state from the authoritative source (the player's local client).
+            /// Used for remote players in multiplayer to avoid happiness calculation desync.
+            /// </summary>
+            /// <param name="remoteHappiness">The happiness value from the authoritative client.</param>
+            /// <param name="remoteFailed">Whether the player has failed according to the authoritative client.</param>
+            public void SyncRemoteHappiness(float remoteHappiness, bool remoteFailed)
             {
-                if (noteWeight <= 0)
+                bool wasFailedBefore = HasFailed;
+                
+                // Directly set happiness from authoritative source
+                Happiness = Math.Clamp(remoteHappiness, HAPPINESS_MINIMUM, 1f);
+                
+                // Validate fail state consistency:
+                // If happiness is at or below fail threshold but remoteFailed is false,
+                // this is inconsistent state (likely a race condition or desync).
+                // Treat it as failed to prevent spurious revival events.
+                if (Happiness <= HAPPINESS_FAIL_THRESHOLD && !remoteFailed)
                 {
-                    return;
-                }
-
-                float delta;
-
-                if (wasHit)
-                {
-                    delta = HAPPINESS_PER_NOTE_HIT * RockMeterPreset.HitRecoveryMultiplier;
-
-                    if (_engineManager.IsAnyStarpowerActive)
-                    {
-                        delta *= RockMeterPreset.StarPowerEffectMultiplier;
-                    }
+                    // Don't trust the remoteFailed=false if happiness indicates failure
+                    // The player should be in failed state
+                    HasFailed = true;
                 }
                 else
                 {
-                    delta = -1 * HAPPINESS_PER_NOTE_MISS * RockMeterPreset.MissDamageMultiplier;
+                    HasFailed = remoteFailed;
                 }
+                
+                // Detect state transitions
+                if (!wasFailedBefore && HasFailed)
+                {
+                    // Player just failed - fire the event
+                    // Also clear the local revival flag since they've failed again
+                    _wasRevivedLocally = false;
+                    _engineManager.OnPlayerFailed?.Invoke(EngineId);
+                }
+                else if (wasFailedBefore && !HasFailed)
+                {
+                    // Player was revived according to network state.
+                    // Only fire the revival event if:
+                    // 1. We didn't already process it locally (prevents duplicates from Star Power)
+                    // 2. The happiness is at a reasonable revival level (at least 10%)
+                    //    This prevents spurious revivals from desync where happiness is very low
+                    //    but hasFailed flag hasn't caught up yet.
+                    //    True revivals via Star Power set happiness to REVIVAL_HAPPINESS (50%).
+                    const float MIN_REVIVAL_HAPPINESS = 0.1f;
+                    
+                    if (!_wasRevivedLocally && Happiness >= MIN_REVIVAL_HAPPINESS)
+                    {
+                        _graceEndTime = Engine.CurrentTime + REVIVAL_GRACE_PERIOD;
+                        _graceEventsRemaining = GRACE_EVENTS_MAX;
+                        _engineManager.OnPlayerRevived?.Invoke(EngineId, remoteHappiness);
+                    }
+                    else if (!_wasRevivedLocally && Happiness < MIN_REVIVAL_HAPPINESS)
+                    {
+                        // Low happiness but not failed - likely a desync.
+                        // Don't fire revival event, but mark as failed to be safe.
+                        HasFailed = true;
+                    }
+                    // Note: _wasRevivedLocally stays true until the player fails again
+                }
+                
+                _engineManager.UpdateHappiness();
+            }
 
-                AddHappiness(delta * noteWeight);
+            /// <summary>
+            /// Applies a remote note result for tracking purposes.
+            /// Note: This method no longer modifies happiness because for remote players,
+            /// the authoritative happiness/fail state comes from SyncRemoteHappiness().
+            /// Local happiness calculations would cause race conditions with network state
+            /// (e.g., local engine detects fail while network says player is still alive,
+            /// then network sync triggers a false "revival").
+            /// </summary>
+            public void ApplyRemoteNoteResult(int noteWeight, bool wasHit)
+            {
+                // NOTE: Intentionally does NOT call AddHappiness anymore.
+                // For remote players, happiness and fail state are synced authoritatively
+                // via SyncRemoteHappiness() from the network. If we calculated happiness
+                // locally here, it would race with network state and cause issues like:
+                // - Local engine detects fail (based on local note resolution timing)
+                // - Network sync arrives with hasFailed=false (remote client's actual state)
+                // - This triggers OnPlayerRevived (false revival)
+                // - Then network sync with hasFailed=true arrives and triggers OnPlayerFailed again
+                // 
+                // By relying solely on SyncRemoteHappiness for happiness/fail state,
+                // spectator tracks accurately reflect the remote player's actual state.
             }
 
             private void AddHappiness(float delta)
             {
+                // Don't process happiness changes for already failed players
+                if (HasFailed)
+                {
+                    return;
+                }
+                
+                // During grace period after revival, ignore negative happiness changes
+                // This gives the player time for their track to raise back up
+                if (delta < 0 && IsInGracePeriod)
+                {
+                    // Decrement event counter for the fallback grace system
+                    if (_graceEventsRemaining > 0)
+                    {
+                        _graceEventsRemaining--;
+                    }
+                    return;
+                }
+                
                 Happiness = Math.Clamp(Happiness + delta, HAPPINESS_MINIMUM, 1f);
+
+                // Check if this player just failed
+                if (Happiness <= HAPPINESS_FAIL_THRESHOLD && !HasFailed)
+                {
+                    HasFailed = true;
+                    _engineManager.OnPlayerFailed?.Invoke(EngineId);
+                }
 
                 _engineManager.UpdateHappiness();
             }
